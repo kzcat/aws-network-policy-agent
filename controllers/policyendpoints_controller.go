@@ -38,18 +38,16 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-
-
-	networking "k8s.io/api/networking/v1"
+		"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	
+		networking "k8s.io/api/networking/v1"
 )
 
 func log() logger.Logger {
@@ -901,51 +899,48 @@ func (r *PolicyEndpointsReconciler) addCatchAllEntry(firewallRules *[]fwrp.EbpfF
 		})
 }
 
-// PodEventHandler handles Pod events and triggers reconciliation.
-type PodEventHandler struct {
-	reconciler *PolicyEndpointsReconciler
+// podLabelChangePredicate returns true for create/delete and for update only when labels changed.
+var podLabelChangePredicate = predicate.Funcs{
+	CreateFunc: func(e event.CreateEvent) bool { return true },
+	DeleteFunc: func(e event.DeleteEvent) bool { return true },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		if e.ObjectOld == nil || e.ObjectNew == nil {
+			return false
+		}
+		return labelsChanged(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
+	},
+	GenericFunc: func(e event.GenericEvent) bool { return false },
 }
 
-// Create handles Pod creation events.
-func (h *PodEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	requests := h.reconciler.OnPodCreate(ctx, e.Object)
-	for _, req := range requests {
-		q.Add(req)
+// mapPodToPolicyEndpoints converts a Pod object to a list of reconcile.Request
+// for PolicyEndpoints that may be affected by that Pod.
+func (r *PolicyEndpointsReconciler) mapPodToPolicyEndpoints(ctx context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || pod == nil {
+		return nil
 	}
-}
-
-// Update handles Pod update events.
-func (h *PodEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	requests := h.reconciler.OnPodUpdate(ctx, e.ObjectOld, e.ObjectNew)
-	for _, req := range requests {
-		q.Add(req)
+	// Only consider pods on this node (fast path)
+	if pod.Status.HostIP != r.nodeIP {
+		return nil
 	}
-}
 
-// Delete handles Pod deletion events.
-func (h *PodEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	requests := h.reconciler.OnPodDelete(ctx, e.Object)
-	for _, req := range requests {
-		q.Add(req)
-	}
-}
+	// Invalidate cache for the affected pod
+	r.invalidateCacheForPod(pod)
 
-// Generic handles generic events.
-func (h *PodEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	// No generic handling needed
+	// Reuse existing findAffectedPolicyEndpoints helper
+	return r.findAffectedPolicyEndpoints(ctx, pod)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&policyk8sawsv1.PolicyEndpoint{}).
-		WatchesRawSource(
-			source.Kind(
-				mgr.GetCache(),
-				&corev1.Pod{},
-				&PodEventHandler{reconciler: r},
-				PodLabelChangePredicate{},
-			),
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return r.mapPodToPolicyEndpoints(ctx, obj)
+			}),
+			builder.WithPredicates(podLabelChangePredicate),
 		).
 		Complete(r)
 }
@@ -1007,96 +1002,6 @@ func (r *PolicyEndpointsReconciler) ArePoliciesAvailableInLocalCache(podIdentifi
 		}
 	}
 	return false
-}
-
-// PodEventHandler handles Pod lifecycle events for label selector mode.
-// It detects label changes and triggers reconciliation for affected PolicyEndpoints.
-
-// OnPodCreate handles new Pod creation events.
-// When a new Pod is created with labels matching an existing PolicyEndpoint's selector,
-// this triggers reconciliation for affected PolicyEndpoints.
-func (r *PolicyEndpointsReconciler) OnPodCreate(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
-	log().Infof("Pod created: %s/%s", pod.Namespace, pod.Name)
-
-	// Only process pods on the local node
-	if pod.Status.HostIP != r.nodeIP {
-		return nil
-	}
-
-	// Invalidate selector cache for any selectors that might match this pod
-	r.invalidateCacheForPod(pod)
-
-	// Find PolicyEndpoints whose selectors match this pod
-	return r.findAffectedPolicyEndpoints(ctx, pod)
-}
-
-// OnPodUpdate handles Pod update events including label changes.
-// When a Pod's labels change, this detects the change and triggers reconciliation
-// for PolicyEndpoints that were affected by the old labels or are affected by the new labels.
-func (r *PolicyEndpointsReconciler) OnPodUpdate(ctx context.Context, oldPod, newPod *corev1.Pod) []reconcile.Request {
-	// Only process pods on the local node
-	if newPod.Status.HostIP != r.nodeIP && oldPod.Status.HostIP != r.nodeIP {
-		return nil
-	}
-
-	// Check if labels have changed
-	if !labelsChanged(oldPod.Labels, newPod.Labels) {
-		return nil
-	}
-
-	log().Infof("Pod labels changed: %s/%s", newPod.Namespace, newPod.Name)
-
-	// Invalidate selector cache for any selectors that might be affected
-	r.invalidateCacheForPod(oldPod)
-	r.invalidateCacheForPod(newPod)
-
-	// Find PolicyEndpoints affected by both old and new labels
-	var requests []reconcile.Request
-	seenPEs := make(map[types.NamespacedName]bool)
-
-	// Find PolicyEndpoints that matched the old labels
-	oldRequests := r.findAffectedPolicyEndpoints(ctx, oldPod)
-	for _, req := range oldRequests {
-		if !seenPEs[req.NamespacedName] {
-			requests = append(requests, req)
-			seenPEs[req.NamespacedName] = true
-		}
-	}
-
-	// Find PolicyEndpoints that match the new labels
-	newRequests := r.findAffectedPolicyEndpoints(ctx, newPod)
-	for _, req := range newRequests {
-		if !seenPEs[req.NamespacedName] {
-			requests = append(requests, req)
-			seenPEs[req.NamespacedName] = true
-		}
-	}
-
-	return requests
-}
-
-// OnPodDelete handles Pod deletion events.
-// When a Pod is deleted, this triggers reconciliation for PolicyEndpoints
-// whose selectors matched the deleted Pod.
-func (r *PolicyEndpointsReconciler) OnPodDelete(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
-	log().Infof("Pod deleted: %s/%s", pod.Namespace, pod.Name)
-
-	// Only process pods on the local node
-	if pod.Status.HostIP != r.nodeIP {
-		return nil
-	}
-
-	// Invalidate selector cache specific to this pod
-	if r.selectorCache != nil {
-		r.selectorCache.InvalidateForPodDelete(types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace})
-		// Update cache size metric after invalidation
-		if r.metricsCollector != nil {
-			r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
-		}
-	}
-
-	// Find PolicyEndpoints whose selectors matched this pod
-	return r.findAffectedPolicyEndpoints(ctx, pod)
 }
 
 // labelsChanged checks if the labels have changed between old and new pod.
@@ -1194,32 +1099,5 @@ func (r *PolicyEndpointsReconciler) podInPodSelectorEndpoints(pod *corev1.Pod, e
 			return true
 		}
 	}
-	return false
-}
-
-// PodLabelChangePredicate filters Pod events to only process relevant changes.
-// It passes through create and delete events, and for update events,
-// it only passes through if labels have changed.
-type PodLabelChangePredicate struct {
-	predicate.TypedFuncs[*corev1.Pod]
-}
-
-// Create returns true for Pod create events.
-func (p PodLabelChangePredicate) Create(e event.TypedCreateEvent[*corev1.Pod]) bool {
-	return true
-}
-
-// Delete returns true for Pod delete events.
-func (p PodLabelChangePredicate) Delete(e event.TypedDeleteEvent[*corev1.Pod]) bool {
-	return true
-}
-
-// Update returns true only if Pod labels have changed.
-func (p PodLabelChangePredicate) Update(e event.TypedUpdateEvent[*corev1.Pod]) bool {
-	return labelsChanged(e.ObjectOld.Labels, e.ObjectNew.Labels)
-}
-
-// Generic returns false for generic events.
-func (p PodLabelChangePredicate) Generic(e event.TypedGenericEvent[*corev1.Pod]) bool {
 	return false
 }
