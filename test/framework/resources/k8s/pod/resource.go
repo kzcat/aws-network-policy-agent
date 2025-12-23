@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-network-policy-agent/test/framework/utils"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -91,10 +90,7 @@ func (d *defaultManager) GetPodsWithLabel(context context.Context, namespace str
 	labelKey string, labelValue string) ([]v1.Pod, error) {
 
 	podList := &v1.PodList{}
-	err := d.k8sClient.List(context, podList, &client.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{labelKey: labelValue}),
-		Namespace:     namespace,
-	})
+	err := d.k8sClient.List(context, podList, client.InNamespace(namespace), client.MatchingLabels{labelKey: labelValue})
 
 	return podList.Items, err
 }
@@ -118,9 +114,7 @@ func (d *defaultManager) DeleteAllPodsForcefully(context context.Context,
 	podLabelKey string, podLabelVal string) error {
 
 	podList := &v1.PodList{}
-	d.k8sClient.List(context, podList, &client.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{podLabelKey: podLabelVal}),
-	})
+	d.k8sClient.List(context, podList, client.MatchingLabels{podLabelKey: podLabelVal})
 
 	if len(podList.Items) == 0 {
 		return fmt.Errorf("no pods found with label %s:%s", podLabelKey, podLabelVal)

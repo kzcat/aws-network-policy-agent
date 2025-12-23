@@ -399,7 +399,7 @@ func (r *ClusterPolicyEndpointsReconciler) getClusterPolicyEndpointsOfParentCNP(
 
 	ClusterPolicyEndpointList := &policyk8sawsv1.ClusterPolicyEndpointList{}
 	// Cluster-scoped: no namespace filter
-	if err := r.k8sClient.List(ctx, ClusterPolicyEndpointList, &client.ListOptions{}); err != nil {
+	if err := r.k8sClient.List(ctx, ClusterPolicyEndpointList); err != nil {
 		log().Errorf("Unable to list ClusterPolicyEndpoints err: %v", err)
 		return nil
 	}

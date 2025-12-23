@@ -38,14 +38,16 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
+
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
 
 	networking "k8s.io/api/networking/v1"
 )
@@ -645,7 +647,7 @@ func (r *PolicyEndpointsReconciler) deriveTargetPodsFromLabelSelector(ctx contex
 	}
 
 	// Try to get from cache first
-	if cachedPods, found := r.selectorCache.Get(selectorHash); found {
+	if cachedPods, found := r.selectorCache.Get(policyEndpoint.Namespace, selectorHash); found {
 		log().Debugf("Cache hit for selector hash %s", selectorHash)
 		// Record cache hit metric
 		if r.metricsCollector != nil {
@@ -686,7 +688,7 @@ func (r *PolicyEndpointsReconciler) deriveTargetPodsFromLabelSelector(ctx contex
 
 	// Cache the results
 	if len(targetPods) > 0 {
-		r.selectorCache.Set(selectorHash, targetPods)
+		r.selectorCache.Set(policyEndpoint.Namespace, selectorHash, policyEndpoint.Spec.PodSelector, targetPods)
 		// Update cache size metric
 		if r.metricsCollector != nil {
 			r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
@@ -746,12 +748,7 @@ func (r *PolicyEndpointsReconciler) listPodsByLabelSelector(ctx context.Context,
 
 	// List pods matching the selector
 	podList := &corev1.PodList{}
-	listOpts := &client.ListOptions{
-		Namespace:     namespace,
-		LabelSelector: labelSelector,
-	}
-
-	if err := r.k8sClient.List(ctx, podList, listOpts); err != nil {
+	if err := r.k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: labelSelector}); err != nil {
 		return nil, err
 	}
 
@@ -899,6 +896,40 @@ func (r *PolicyEndpointsReconciler) addCatchAllEntry(firewallRules *[]fwrp.EbpfF
 		})
 }
 
+// PodEventHandler handles Pod events and triggers reconciliation.
+type PodEventHandler struct {
+	reconciler *PolicyEndpointsReconciler
+}
+
+// Create handles Pod creation events.
+func (h *PodEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	requests := h.reconciler.OnPodCreate(ctx, e.Object)
+	for _, req := range requests {
+		q.Add(req)
+	}
+}
+
+// Update handles Pod update events.
+func (h *PodEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	requests := h.reconciler.OnPodUpdate(ctx, e.ObjectOld, e.ObjectNew)
+	for _, req := range requests {
+		q.Add(req)
+	}
+}
+
+// Delete handles Pod deletion events.
+func (h *PodEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	requests := h.reconciler.OnPodDelete(ctx, e.Object)
+	for _, req := range requests {
+		q.Add(req)
+	}
+}
+
+// Generic handles generic events.
+func (h *PodEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[*corev1.Pod], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// No generic handling needed
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -907,35 +938,18 @@ func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ct
 			source.Kind(
 				mgr.GetCache(),
 				&corev1.Pod{},
-				handler.TypedEnqueueRequestsFromMapFunc(r.mapPodToReconcileRequests),
+				&PodEventHandler{reconciler: r},
 				PodLabelChangePredicate{},
 			),
 		).
 		Complete(r)
 }
 
-// mapPodToReconcileRequests maps Pod events to reconcile requests for affected PolicyEndpoints.
-// This is called by the controller-runtime when a Pod event passes the PodLabelChangePredicate filter.
-func (r *PolicyEndpointsReconciler) mapPodToReconcileRequests(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
-	// Only process pods on the local node
-	if pod.Status.HostIP != r.nodeIP {
-		return nil
-	}
-
-	// Invalidate selector cache for any selectors that might be affected
-	r.invalidateCacheForPod(pod)
-
-	// Find PolicyEndpoints whose selectors match this pod
-	return r.findAffectedPolicyEndpoints(ctx, pod)
-}
-
 func (r *PolicyEndpointsReconciler) derivePolicyEndpointsOfParentNP(ctx context.Context, parentNP, resourceNamespace string) []string {
 	var parentPolicyEndpointList []string
 
 	policyEndpointList := &policyk8sawsv1.PolicyEndpointList{}
-	if err := r.k8sClient.List(ctx, policyEndpointList, &client.ListOptions{
-		Namespace: resourceNamespace,
-	}); err != nil {
+	if err := r.k8sClient.List(ctx, policyEndpointList, client.InNamespace(resourceNamespace)); err != nil {
 		log().Errorf("Unable to list PolicyEndpoints err: %v", err)
 		return nil
 	}
@@ -1113,10 +1127,8 @@ func (r *PolicyEndpointsReconciler) invalidateCacheForPod(pod *corev1.Pod) {
 		return
 	}
 
-	// Invalidate all cache entries for the pod's namespace
-	// This is a conservative approach - we could be more precise by checking
-	// which selectors actually match the pod's labels
-	r.selectorCache.InvalidateByNamespace(pod.Namespace)
+	// Invalidate cache entries affected by this pod's labels
+	r.selectorCache.InvalidateForPodUpdate(pod)
 
 	// Update cache size metric after invalidation
 	if r.metricsCollector != nil {
@@ -1131,9 +1143,7 @@ func (r *PolicyEndpointsReconciler) findAffectedPolicyEndpoints(ctx context.Cont
 
 	// List all PolicyEndpoints in the pod's namespace
 	policyEndpointList := &policyk8sawsv1.PolicyEndpointList{}
-	if err := r.k8sClient.List(ctx, policyEndpointList, &client.ListOptions{
-		Namespace: pod.Namespace,
-	}); err != nil {
+	if err := r.k8sClient.List(ctx, policyEndpointList, client.InNamespace(pod.Namespace)); err != nil {
 		log().Errorf("Failed to list PolicyEndpoints for namespace %s: %v", pod.Namespace, err)
 		return requests
 	}

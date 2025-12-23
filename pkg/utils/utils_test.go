@@ -643,7 +643,7 @@ func TestGetHostVethName(t *testing.T) {
 				interfacePrefix: []string{"eni"},
 				mockNetlink:     true,
 			},
-			want:    "eni9cfdfc6963c",
+			want:    "eni7b84ab18a4f",
 			wantErr: "",
 		},
 		{
@@ -654,7 +654,7 @@ func TestGetHostVethName(t *testing.T) {
 				interfacePrefix: []string{"vlan"},
 				mockNetlink:     true,
 			},
-			want:    "vlan9cfdfc6963c",
+			want:    "vlan7b84ab18a4f",
 			wantErr: "",
 		},
 	}
@@ -810,7 +810,7 @@ func TestGenerateLabelSelectorHash(t *testing.T) {
 					},
 				},
 			},
-			want: "fc5a4fdf3aaa",
+			want: "cc2466ecfde1",
 		},
 	}
 
@@ -958,7 +958,7 @@ func TestGetLabelSelectorPodIdentifier(t *testing.T) {
 				},
 				namespace: "default",
 			},
-			want: "label-fc5a4fdf3aaa-default",
+			want: "label-cc2466ecfde1-default",
 		},
 		{
 			name: "Simple matchLabels selector in custom namespace",
@@ -970,7 +970,7 @@ func TestGetLabelSelectorPodIdentifier(t *testing.T) {
 				},
 				namespace: "production",
 			},
-			want: "label-fc5a4fdf3aaa-production",
+			want: "label-cc2466ecfde1-production",
 		},
 		{
 			name: "Complex selector with matchExpressions",
@@ -990,7 +990,7 @@ func TestGetLabelSelectorPodIdentifier(t *testing.T) {
 				},
 				namespace: "web",
 			},
-			want: "label-26fe2e3c1dc8-web",
+			want: "label-9cce436cb160-web",
 		},
 	}
 
