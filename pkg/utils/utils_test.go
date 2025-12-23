@@ -2,12 +2,14 @@ package utils
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestComputeTrieKey(t *testing.T) {
@@ -772,4 +774,285 @@ func TestIsMissingFilterError(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+
+func TestGenerateLabelSelectorHash(t *testing.T) {
+	type args struct {
+		selector *metav1.LabelSelector
+	}
+
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "Nil selector returns empty string",
+			args: args{
+				selector: nil,
+			},
+			want: "",
+		},
+		{
+			name: "Empty selector returns consistent hash",
+			args: args{
+				selector: &metav1.LabelSelector{},
+			},
+			want: "44136fa355b3", // SHA-256 of "{}"
+		},
+		{
+			name: "Simple matchLabels selector",
+			args: args{
+				selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "nginx",
+					},
+				},
+			},
+			want: "fc5a4fdf3aaa",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GenerateLabelSelectorHash(tt.args.selector)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestGenerateLabelSelectorHash_Determinism(t *testing.T) {
+	// Test that the same selector always produces the same hash
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app":  "nginx",
+			"tier": "frontend",
+		},
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      "environment",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"production", "staging"},
+			},
+		},
+	}
+
+	hash1 := GenerateLabelSelectorHash(selector)
+	hash2 := GenerateLabelSelectorHash(selector)
+	hash3 := GenerateLabelSelectorHash(selector)
+
+	assert.Equal(t, hash1, hash2, "Hash should be deterministic")
+	assert.Equal(t, hash2, hash3, "Hash should be deterministic")
+	assert.Len(t, hash1, 12, "Hash should be 12 characters")
+}
+
+func TestGenerateLabelSelectorHash_OrderIndependence(t *testing.T) {
+	// Test that different orderings of the same labels produce the same hash
+	selector1 := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app":  "nginx",
+			"tier": "frontend",
+			"env":  "prod",
+		},
+	}
+
+	selector2 := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"tier": "frontend",
+			"env":  "prod",
+			"app":  "nginx",
+		},
+	}
+
+	hash1 := GenerateLabelSelectorHash(selector1)
+	hash2 := GenerateLabelSelectorHash(selector2)
+
+	assert.Equal(t, hash1, hash2, "Hash should be order-independent for matchLabels")
+}
+
+func TestGenerateLabelSelectorHash_MatchExpressionsOrderIndependence(t *testing.T) {
+	// Test that different orderings of matchExpressions produce the same hash
+	selector1 := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"nginx", "apache"},
+			},
+			{
+				Key:      "env",
+				Operator: metav1.LabelSelectorOpNotIn,
+				Values:   []string{"dev"},
+			},
+		},
+	}
+
+	selector2 := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      "env",
+				Operator: metav1.LabelSelectorOpNotIn,
+				Values:   []string{"dev"},
+			},
+			{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"apache", "nginx"}, // Different order of values
+			},
+		},
+	}
+
+	hash1 := GenerateLabelSelectorHash(selector1)
+	hash2 := GenerateLabelSelectorHash(selector2)
+
+	assert.Equal(t, hash1, hash2, "Hash should be order-independent for matchExpressions")
+}
+
+func TestGenerateLabelSelectorHash_DifferentSelectorsProduceDifferentHashes(t *testing.T) {
+	selector1 := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app": "nginx",
+		},
+	}
+
+	selector2 := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app": "apache",
+		},
+	}
+
+	hash1 := GenerateLabelSelectorHash(selector1)
+	hash2 := GenerateLabelSelectorHash(selector2)
+
+	assert.NotEqual(t, hash1, hash2, "Different selectors should produce different hashes")
+}
+
+
+func TestGetLabelSelectorPodIdentifier(t *testing.T) {
+	type args struct {
+		selector  *metav1.LabelSelector
+		namespace string
+	}
+
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "Nil selector returns empty string",
+			args: args{
+				selector:  nil,
+				namespace: "default",
+			},
+			want: "",
+		},
+		{
+			name: "Simple matchLabels selector in default namespace",
+			args: args{
+				selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "nginx",
+					},
+				},
+				namespace: "default",
+			},
+			want: "label-fc5a4fdf3aaa-default",
+		},
+		{
+			name: "Simple matchLabels selector in custom namespace",
+			args: args{
+				selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "nginx",
+					},
+				},
+				namespace: "production",
+			},
+			want: "label-fc5a4fdf3aaa-production",
+		},
+		{
+			name: "Complex selector with matchExpressions",
+			args: args{
+				selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app":  "nginx",
+						"tier": "frontend",
+					},
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      "environment",
+							Operator: metav1.LabelSelectorOpIn,
+							Values:   []string{"production", "staging"},
+						},
+					},
+				},
+				namespace: "web",
+			},
+			want: "label-26fe2e3c1dc8-web",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetLabelSelectorPodIdentifier(tt.args.selector, tt.args.namespace)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestGetLabelSelectorPodIdentifier_Format(t *testing.T) {
+	// Test that the identifier follows the expected format: "label-{hash}-{namespace}"
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app": "test",
+		},
+	}
+
+	identifier := GetLabelSelectorPodIdentifier(selector, "myns")
+
+	// Verify format
+	assert.True(t, strings.HasPrefix(identifier, "label-"), "Identifier should start with 'label-'")
+	assert.True(t, strings.HasSuffix(identifier, "-myns"), "Identifier should end with '-{namespace}'")
+
+	// Verify structure: label-{12 char hash}-{namespace}
+	parts := strings.Split(identifier, "-")
+	assert.Equal(t, 3, len(parts), "Identifier should have 3 parts separated by '-'")
+	assert.Equal(t, "label", parts[0])
+	assert.Len(t, parts[1], 12, "Hash should be 12 characters")
+	assert.Equal(t, "myns", parts[2])
+}
+
+func TestGetLabelSelectorPodIdentifier_Determinism(t *testing.T) {
+	// Test that the same selector and namespace always produce the same identifier
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app":  "nginx",
+			"tier": "frontend",
+		},
+	}
+
+	id1 := GetLabelSelectorPodIdentifier(selector, "default")
+	id2 := GetLabelSelectorPodIdentifier(selector, "default")
+	id3 := GetLabelSelectorPodIdentifier(selector, "default")
+
+	assert.Equal(t, id1, id2, "Identifier should be deterministic")
+	assert.Equal(t, id2, id3, "Identifier should be deterministic")
+}
+
+func TestGetLabelSelectorPodIdentifier_DifferentNamespaces(t *testing.T) {
+	// Test that the same selector in different namespaces produces different identifiers
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			"app": "nginx",
+		},
+	}
+
+	id1 := GetLabelSelectorPodIdentifier(selector, "namespace1")
+	id2 := GetLabelSelectorPodIdentifier(selector, "namespace2")
+
+	assert.NotEqual(t, id1, id2, "Different namespaces should produce different identifiers")
+	assert.Contains(t, id1, "namespace1")
+	assert.Contains(t, id2, "namespace2")
 }

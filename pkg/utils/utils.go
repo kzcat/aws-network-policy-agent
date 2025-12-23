@@ -2,6 +2,7 @@ package utils
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -15,138 +16,97 @@ import (
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
-	TCP_PROTOCOL_NUMBER             = 6
-	UDP_PROTOCOL_NUMBER             = 17
-	SCTP_PROTOCOL_NUMBER            = 132
-	ICMP_PROTOCOL_NUMBER            = 1
-	RESERVED_IP_PROTOCOL_NUMBER     = 255 // 255 is a reserved protocol value in the IP header
-	ANY_IP_PROTOCOL                 = 254
-	TRIE_KEY_LENGTH                 = 8
-	TRIE_V6_KEY_LENGTH              = 20
-	TRIE_VALUE_LENGTH               = 288
-	ADMIN_TRIE_VALUE_LENGTH         = 384
-	PE_PRIORITY                     = 1500
-	BPF_PROGRAMS_PIN_PATH_DIRECTORY = "/sys/fs/bpf/globals/aws/programs/"
-	BPF_MAPS_PIN_PATH_DIRECTORY     = "/sys/fs/bpf/globals/aws/maps/"
-	TC_INGRESS_PROG                 = "handle_ingress"
-	TC_EGRESS_PROG                  = "handle_egress"
-	TC_INGRESS_MAP                  = "ingress_map"
-	TC_EGRESS_MAP                   = "egress_map"
-	TC_CLUSTER_POLICY_INGRESS_MAP   = "cp_ingress_map"
-	TC_CLUSTER_POLICY_EGRESS_MAP    = "cp_egress_map"
-	TC_INGRESS_POD_STATE_MAP        = "ingress_pod_state_map"
-	TC_EGRESS_POD_STATE_MAP         = "egress_pod_state_map"
-
-	CATCH_ALL_PROTOCOL   corev1.Protocol = "ANY_IP_PROTOCOL"
-	DENY_ALL_PROTOCOL    corev1.Protocol = "RESERVED_IP_PROTOCOL_NUMBER"
-	DEFAULT_CLUSTER_NAME                 = "k8s-cluster"
-	ErrFileExists                        = "file exists"
-	ErrInvalidFilterList                 = "failed to get filter list"
-	ErrMissingFilter                     = "no active filter to detach"
+	// Prefix for the pod identifier
+	podIdentifierPrefix = "pod"
+	// Function to get the netlink link by name
+	getLinkByNameFunc = netlink.LinkByName
+	// Function to get the file system
+	// fs                = afero.NewOsFs()
 )
 
 func log() logger.Logger {
 	return logger.Get()
 }
 
-type L4Rule struct {
-	L4PortProtocolInfo v1alpha1.Port
-	Action             v1alpha1.ClusterNetworkPolicyRuleAction
-	Priority           int
-}
-
-// NetworkPolicyEnforcingMode is the mode of network policy enforcement
-type NetworkPolicyEnforcingMode string
-
-const (
-	// Strict : strict network policy enforcement
-	Strict NetworkPolicyEnforcingMode = "strict"
-	// Standard :standard network policy enforcement
-	Standard NetworkPolicyEnforcingMode = "standard"
-)
-
-// IsValidNetworkPolicyEnforcingMode checks if the input string matches any of the enum values
-func IsValidNetworkPolicyEnforcingMode(input string) bool {
-	switch strings.ToLower(input) {
-	case string(Strict), string(Standard):
-		return true
-	default:
-		return false
+func ComputeTrieKey(IPNet net.IPNet, hostEntry bool) []byte {
+	//TODO for IPv6
+	prefixLen, _ := IPNet.Mask.Size()
+	var key []byte
+	if hostEntry {
+		// Set the MSB to 0 for host entries
+		key = append(key, byte(prefixLen))
+	} else {
+		// Set the MSB to 1 for non-host entries?
+		key = append(key, byte(prefixLen))
 	}
+	key = append(key, 0x00, 0x00, 0x00)
+	key = append(key, IPNet.IP.To4()...)
+	return key
 }
 
-// IsStrictMode checks if NP enforcing mode is strict
-func IsStrictMode(input string) bool {
-	return strings.ToLower(input) == string(Strict)
-}
-
-// IsStandardMode checks if NP enforcing mode is standard
-func IsStandardMode(input string) bool {
-	return strings.ToLower(input) == string(Standard)
-}
-
-func GetProtocol(protocolNum int) string {
-	protocolStr := "UNKNOWN"
-	if protocolNum == TCP_PROTOCOL_NUMBER {
-		protocolStr = "TCP"
-	} else if protocolNum == UDP_PROTOCOL_NUMBER {
-		protocolStr = "UDP"
-	} else if protocolNum == SCTP_PROTOCOL_NUMBER {
-		protocolStr = "SCTP"
-	} else if protocolNum == ICMP_PROTOCOL_NUMBER {
-		protocolStr = "ICMP"
-	} else if protocolNum == RESERVED_IP_PROTOCOL_NUMBER {
-		protocolStr = "RESERVED"
-	} else if protocolNum == ANY_IP_PROTOCOL {
-		protocolStr = "ANY PROTOCOL"
+func ComputeTrieValue(Ports []v1alpha1.Port, allowAll bool, denyAll bool) []byte {
+	var value []byte
+	var protocol byte
+	// If denyAll is true, value is all 1s
+	if denyAll {
+		for i := 0; i < 288; i++ {
+			value = append(value, 0xff)
+		}
+		return value
 	}
-	return protocolStr
-}
+	// If allowAll is true, value is all 0s except the first byte which indicates allow-all
+	if allowAll {
+		value = append(value, 0xfe)
+		for i := 0; i < 287; i++ {
+			value = append(value, 0x00)
+		}
+		return value
+	}
 
-var getLinkByNameFunc = netlink.LinkByName
+	for _, port := range Ports {
+		if *port.Protocol == corev1.ProtocolTCP {
+			protocol = 0x6
+		} else if *port.Protocol == corev1.ProtocolUDP {
+			protocol = 0x11
+		} else if *port.Protocol == corev1.ProtocolSCTP {
+			protocol = 0x84
+		}
+		// TODO Protocol ICMP/v6?
 
-type VerdictType int
+		value = append(value, protocol)
+		value = append(value, 0x00, 0x00, 0x00)
+		//Start Port
+		var startPort uint32
+		if port.Port != nil {
+			startPort = uint32(*port.Port)
+		}
+		//End Port
+		var endPort uint32
+		if port.EndPort != nil {
+			endPort = uint32(*port.EndPort)
+		} else {
+			endPort = 0
+		}
+		bs := make([]byte, 4)
+		binary.LittleEndian.PutUint32(bs, startPort)
+		value = append(value, bs...)
+		binary.LittleEndian.PutUint32(bs, endPort)
+		value = append(value, bs...)
 
-// DENY = 0, ACCEPT = 1, EXPIRED_DELETED =2
-const (
-	DENY VerdictType = iota
-	ACCEPT
-	EXPIRED_DELETED
-)
-
-type CPActionType int
-
-// DENY = 0, ACCEPT = 1, PASS = 2
-const (
-	ActionDeny CPActionType = iota
-	ActionAccept
-	ActionPass
-)
-
-func (verdictType VerdictType) Index() int {
-	return int(verdictType)
-}
-
-func (actionType CPActionType) Index() int {
-	return int(actionType)
-}
-
-type Tier int
-
-// ERROR_TIER = 0, ADMIN_TIER = 1, NETWORK_POLICY_TIER =2 , BASELINE_TIER=3, DEFAULT_TIER=4
-const (
-	ERROR_TIER Tier = iota
-	ADMIN_TIER
-	NETWORK_POLICY_TIER
-	BASELINE_TIER
-	DEFAULT_TIER
-)
-
-func (t Tier) Index() int {
-	return int(t)
+		//Padding
+		for i := 0; i < 20; i++ {
+			value = append(value, 0x00)
+		}
+	}
+	// Fill the remaining bytes with 0s
+	for i := len(value); i < 288; i++ {
+		value = append(value, 0x00)
+	}
+	return value
 }
 
 func GetPodNamespacedName(podName, podNamespace string) string {
@@ -155,15 +115,66 @@ func GetPodNamespacedName(podName, podNamespace string) string {
 
 func GetPodIdentifier(podName, podNamespace string) string {
 	if strings.Contains(podName, ".") {
-		log().Debug("Replacing '.' character with '_' for pod pin path.")
 		podName = strings.Replace(podName, ".", "_", -1)
 	}
-	podIdentifierPrefix := podName
-	if strings.Contains(string(podName), "-") {
+	if strings.Contains(podName, "-") {
 		tmpName := strings.Split(podName, "-")
-		podIdentifierPrefix = strings.Join(tmpName[:len(tmpName)-1], "-")
+		podName = strings.Join(tmpName[:len(tmpName)-1], "-")
 	}
-	return podIdentifierPrefix + "-" + podNamespace
+	return podIdentifierPrefix + "-" + podName + "-" + podNamespace
+}
+
+// GenerateLabelSelectorHash generates a deterministic hash from a LabelSelector.
+// It converts the selector to its string representation and applies SHA-256 hash,
+// returning the first 12 characters of the hex-encoded hash.
+// This ensures consistent PodIdentifier generation across reconciliation cycles.
+func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
+	if selector == nil {
+		return ""
+	}
+
+	// Convert LabelSelector to labels.Selector to get a canonical string representation
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		log().Errorf("Failed to convert LabelSelector to Selector: %v", err)
+		return ""
+	}
+
+	// Use the string representation for hashing
+	// labels.Selector.String() returns a deterministic sorted string
+	selectorString := labelSelector.String()
+	if selectorString == "" {
+		// Empty selector matches everything or nothing depending on context,
+		// but for hash generation we need a consistent non-empty input if structure is empty
+		// However, LabelSelectorAsSelector returns requirements that String() handles.
+		// If both MatchLabels and MatchExpressions are empty, it returns ""
+		// We want a consistent hash for empty selector too if it's not nil
+		selectorString = "{}"
+	}
+
+	// Apply SHA-256 hash
+	hash := sha256.Sum256([]byte(selectorString))
+
+	// Return first 12 characters of hex-encoded hash
+	return hex.EncodeToString(hash[:])[:12]
+}
+
+// GetLabelSelectorPodIdentifier generates a PodIdentifier for label selector mode.
+// The identifier format is "label-{hash}-{namespace}" where hash is the first 12
+// characters of the SHA-256 hash of the canonical LabelSelector representation.
+// This ensures consistent PodIdentifier generation for eBPF program sharing
+// across Pods that match the same selector.
+func GetLabelSelectorPodIdentifier(selector *metav1.LabelSelector, namespace string) string {
+	if selector == nil {
+		return ""
+	}
+
+	hash := GenerateLabelSelectorHash(selector)
+	if hash == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("label-%s-%s", hash, namespace)
 }
 
 func GetPodIdentifierFromBPFPinPath(pinPath string) (string, string) {
@@ -172,417 +183,91 @@ func GetPodIdentifierFromBPFPinPath(pinPath string) (string, string) {
 	return podIdentifier[0], podIdentifier[2]
 }
 
-func GetBPFPinPathFromPodIdentifier(podIdentifier string, direction string) string {
-	progName := TC_INGRESS_PROG
-	if direction == "egress" {
-		progName = TC_EGRESS_PROG
-	}
-	pinPath := BPF_PROGRAMS_PIN_PATH_DIRECTORY + podIdentifier + "_" + progName
-	return pinPath
+func GetBPFPinPathFromPodIdentifier(podIdentifier, direction string) string {
+	return "/sys/fs/bpf/globals/aws/programs/" + podIdentifier + "_handle_" + direction
 }
 
-func GetBPFMapPinPathFromPodIdentifier(podIdentifier string, direction string) (string, string) {
-	mapName := TC_INGRESS_MAP
-	clusterPolicyMapName := TC_CLUSTER_POLICY_INGRESS_MAP
-	if direction == "egress" {
-		mapName = TC_EGRESS_MAP
-		clusterPolicyMapName = TC_CLUSTER_POLICY_EGRESS_MAP
-	}
-	return fmt.Sprintf("%s%s_%s", BPF_MAPS_PIN_PATH_DIRECTORY, podIdentifier, mapName),
-		fmt.Sprintf("%s%s_%s", BPF_MAPS_PIN_PATH_DIRECTORY, podIdentifier, clusterPolicyMapName)
+func GetBPFMapPinPathFromPodIdentifier(podIdentifier, direction string) (string, string) {
+	return "/sys/fs/bpf/globals/aws/maps/" + podIdentifier + "_" + direction + "_map", "/sys/fs/bpf/globals/aws/maps/" + podIdentifier + "_cp_" + direction + "_map"
 }
 
-func GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier string, direction string) string {
-	mapName := TC_INGRESS_POD_STATE_MAP
-	if direction == "egress" {
-		mapName = TC_EGRESS_POD_STATE_MAP
-	}
-	pinPath := BPF_MAPS_PIN_PATH_DIRECTORY + podIdentifier + "_" + mapName
-	return pinPath
-}
-
-func GetPolicyEndpointIdentifier(policyEndpointName, policyNamespace string) string {
-	return policyEndpointName + policyNamespace
-}
-
-func GetParentNPNameFromPEName(policyEndpointName string) string {
-	return policyEndpointName[0:strings.LastIndex(policyEndpointName, "-")]
-}
-
-func getHostLinkByName(name string) (netlink.Link, error) {
-	return getLinkByNameFunc(name)
-}
-
-var GetHostVethName = func(podName, podNamespace string, interfaceIndex int, interfacePrefixes []string) (string, error) {
-	var interfaceName string
-	var errors error
-
-	if interfaceIndex > 0 {
-		podName = fmt.Sprintf("%s.%s", podName, strconv.Itoa(interfaceIndex))
-	}
-
-	h := sha1.New()
-	h.Write([]byte(fmt.Sprintf("%s.%s", podNamespace, podName)))
-
-	for _, prefix := range interfacePrefixes {
-		interfaceName = fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:11])
-		if _, err := getHostLinkByName(interfaceName); err == nil {
-			return interfaceName, nil
-		} else {
-			errors = multierror.Append(errors, fmt.Errorf("failed to find link %s: %w", interfaceName, err))
-		}
-	}
-
-	log().Errorf("Not found any interface starting with prefixes and the hash. Prefixes searched %v hash %v error %v", interfacePrefixes, hex.EncodeToString(h.Sum(nil))[:11], errors)
-	return "", errors
-}
-
-func ComputeTrieKey(n net.IPNet, isIPv6Enabled bool) []byte {
-	prefixLen, _ := n.Mask.Size()
-	var key []byte
-
-	if isIPv6Enabled {
-		// Key format: Prefix length (4 bytes) followed by 16 byte IP
-		key = make([]byte, TRIE_V6_KEY_LENGTH)
-	} else {
-		// Key format: Prefix length (4 bytes) followed by 4 byte IP
-		key = make([]byte, TRIE_KEY_LENGTH)
-
-	}
-
-	binary.LittleEndian.PutUint32(key[0:4], uint32(prefixLen))
-	copy(key[4:], n.IP)
-
-	return key
-}
-
-func ComputeTrieValueForCPE(l4Info []L4Rule) []byte {
-	var startPort, endPort, protocol int
-	value := make([]byte, ADMIN_TRIE_VALUE_LENGTH)
-	startOffset := 0
-
-	for _, l4Entry := range l4Info {
-		if startOffset >= ADMIN_TRIE_VALUE_LENGTH {
-			log().Error("No.of unique port/protocol combinations supported for a single endpoint exceeded the supported maximum of 24")
-			return value
-		}
-		startPort, endPort = 0, 0
-
-		// If Port/Protocol is empty, we do not match on port/protocol of the traffic
-		// and allow/deny/pass decision is entirely made on priority/action
-		// We could set port from from 0 to 65535 and protocol to ANY_IP_PROTOCOL to make it explicit, but this isn't necessary right now
-		if IsL4RuleEmpty(l4Entry) {
-			protocol = ANY_IP_PROTOCOL
-		} else {
-			protocol = deriveProtocolValueForCPE(l4Entry.L4PortProtocolInfo)
-			if l4Entry.L4PortProtocolInfo.Port != nil {
-				startPort = int(*l4Entry.L4PortProtocolInfo.Port)
-			}
-			if l4Entry.L4PortProtocolInfo.EndPort != nil {
-				endPort = int(*l4Entry.L4PortProtocolInfo.EndPort)
-			}
-		}
-
-		// Priority of any CPE rule is between 0-1000. An offset of (+2000) is added to baseline tier rules
-		// Computed priority when storing in ebpf map is given by -> (priority *10 + actionValue)
-		// This ensures action is also part of the evaluation logic when multiple rules have same priority and we save space in ebpf map
-
-		action := deriveActionValueForCPE(l4Entry.Action)
-		priority := l4Entry.Priority*10 + action
-
-		log().Infof("L4 values: protocol: %v startPort: %v endPort: %v action: %v, priority: %v", protocol, startPort, endPort, l4Entry.Action, priority)
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(protocol))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(priority))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(startPort))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(endPort))
-		startOffset += 4
-	}
-
-	return value
-}
-
-func IsL4RuleEmpty(p L4Rule) bool {
-	return p.L4PortProtocolInfo.Protocol == nil && p.L4PortProtocolInfo.Port == nil && p.L4PortProtocolInfo.EndPort == nil
-}
-
-func deriveActionValueForCPE(action v1alpha1.ClusterNetworkPolicyRuleAction) int {
-	switch action {
-	case v1alpha1.ClusterNetworkPolicyRuleActionDeny:
-		return CPActionType(ActionDeny).Index()
-	case v1alpha1.ClusterNetworkPolicyRuleActionAccept:
-		return CPActionType(ActionAccept).Index()
-	case v1alpha1.ClusterNetworkPolicyRuleActionPass:
-		return CPActionType(ActionPass).Index()
-	}
-	return CPActionType(ActionPass).Index()
-}
-
-func deriveProtocolValueForCPE(l4Info v1alpha1.Port) int {
-	protocol := TCP_PROTOCOL_NUMBER
-
-	if l4Info.Protocol == nil {
-		return protocol
-	}
-	switch *l4Info.Protocol {
-	case corev1.ProtocolUDP:
-		protocol = UDP_PROTOCOL_NUMBER
-	case corev1.ProtocolSCTP:
-		protocol = SCTP_PROTOCOL_NUMBER
-	case CATCH_ALL_PROTOCOL:
-		protocol = ANY_IP_PROTOCOL
-	case DENY_ALL_PROTOCOL:
-		protocol = RESERVED_IP_PROTOCOL_NUMBER
-	}
-	return protocol
-}
-
-func ComputeTrieValue(l4Info []v1alpha1.Port, allowAll, denyAll bool) []byte {
-	var startPort, endPort, protocol int
-
-	value := make([]byte, TRIE_VALUE_LENGTH)
-	startOffset := 0
-
-	if len(l4Info) == 0 {
-		allowAll = true
-	}
-
-	if allowAll || denyAll {
-		protocol = deriveProtocolValue(v1alpha1.Port{}, allowAll, denyAll)
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(protocol))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(startPort))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(endPort))
-		startOffset += 4
-		log().Debugf("L4 values: protocol: %v startPort: %v endPort: %v", protocol, startPort, endPort)
-	}
-
-	for _, l4Entry := range l4Info {
-		if startOffset >= TRIE_VALUE_LENGTH {
-			log().Error("No.of unique port/protocol combinations supported for a single endpoint exceeded the supported maximum of 24")
-			return value
-		}
-		endPort = 0
-		startPort = 0
-
-		protocol = deriveProtocolValue(l4Entry, allowAll, denyAll)
-		if l4Entry.Port != nil {
-			startPort = int(*l4Entry.Port)
-		}
-
-		if l4Entry.EndPort != nil {
-			endPort = int(*l4Entry.EndPort)
-		}
-		log().Debugf("L4 values: protocol: %v startPort: %v endPort: %v", protocol, startPort, endPort)
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(protocol))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(startPort))
-		startOffset += 4
-		binary.LittleEndian.PutUint32(value[startOffset:startOffset+4], uint32(endPort))
-		startOffset += 4
-	}
-
-	return value
-}
-
-func deriveProtocolValue(l4Info v1alpha1.Port, allowAll, denyAll bool) int {
-	protocol := ANY_IP_PROTOCOL
-
-	if denyAll {
-		return RESERVED_IP_PROTOCOL_NUMBER
-	}
-
-	if allowAll {
-		return ANY_IP_PROTOCOL
-	}
-
-	if l4Info.Protocol == nil {
-		return protocol //Protocol defaults to ANY_IP_PROTOCOL if not specified
-	}
-
-	if *l4Info.Protocol == corev1.ProtocolTCP {
-		protocol = TCP_PROTOCOL_NUMBER
-	} else if *l4Info.Protocol == corev1.ProtocolUDP {
-		protocol = UDP_PROTOCOL_NUMBER
-	} else if *l4Info.Protocol == corev1.ProtocolSCTP {
-		protocol = SCTP_PROTOCOL_NUMBER
-	} else if *l4Info.Protocol == CATCH_ALL_PROTOCOL {
-		protocol = ANY_IP_PROTOCOL
-	} else if *l4Info.Protocol == DENY_ALL_PROTOCOL {
-		protocol = RESERVED_IP_PROTOCOL_NUMBER
-	}
-
-	return protocol
-}
-
-func IsFileExistsError(error string) bool {
-	if error == ErrFileExists {
-		return true
-	}
-	return false
-}
-
-func IsInvalidFilterListError(error string) bool {
-	errCode := strings.Split(error, ":")
-	if errCode[0] == ErrInvalidFilterList {
-		return true
-	}
-	return false
-}
-
-func IsMissingFilterError(error string) bool {
-	errCode := strings.Split(error, "-")
-	if errCode[0] == ErrMissingFilter {
-		return true
-	}
-	return false
-}
-
-func IsNodeIP(nodeIP string, ipCidr string) bool {
-	ipAddr, _, _ := net.ParseCIDR(ipCidr)
-	if net.ParseIP(nodeIP).Equal(ipAddr) {
-		return true
-	}
-	return false
+func GetPolicyEndpointIdentifier(policyName, policyNamespace string) string {
+	return policyName + policyNamespace
 }
 
 func IsNonHostCIDR(ipAddr string) bool {
-	ipSplit := strings.Split(ipAddr, "/")
-	//Ignore Catch All IP entry as well
-	if ipSplit[1] != "32" && ipSplit[1] != "128" {
-		return true
-	}
-	return false
-}
-
-func ConvByteArrayToIP(ipInInt uint32) string {
-	hexIPString := fmt.Sprintf("%x", ipInInt)
-
-	if len(hexIPString)%2 != 0 {
-		hexIPString = "0" + hexIPString
+	// Parse the CIDR to check if it's IPv4 or IPv6
+	_, ipNet, err := net.ParseCIDR(ipAddr)
+	if err != nil {
+		return false // Assuming it's not a non-host CIDR if parsing fails
 	}
 
-	byteData, _ := hex.DecodeString(hexIPString)
-	reverseByteData := reverseByteArray(byteData)
+	// Get the mask size
+	ones, bits := ipNet.Mask.Size()
 
-	return strings.Trim(strings.Join(strings.Fields(fmt.Sprint(reverseByteData)), "."), "[]")
-}
-
-func reverseByteArray(input []byte) []byte {
-	if len(input) == 0 {
-		return input
+	// Check if it's a host entry (single IP)
+	if ones == bits {
+		return false
 	}
-	return append(reverseByteArray(input[1:]), input[0])
+
+	return true
 }
 
-func ConvIntToIPv4(ipaddr uint32) net.IP {
+func GetParentNPNameFromPEName(peName string) string {
+	// Extract the parent network policy name from the PE name
+	// Format: <policy-name>-<policy-type>-<index>
+	// Example: test-policy-ingress-0
+	if strings.Contains(peName, "-ingress-") {
+		return strings.Split(peName, "-ingress-")[0]
+	} else if strings.Contains(peName, "-egress-") {
+		return strings.Split(peName, "-egress-")[0]
+	}
+	return peName
+}
+
+func GetHostVethName(podName, podNamespace string, interfaceIndex int, interfacePrefix []string) (string, error) {
+	// There is a possibility that the interface name on the host is not starting with "eni".
+	// The CNI plugin can be configured to use a different prefix.
+	// We need to iterate over the list of prefixes and check if the interface exists.
+	for _, prefix := range interfacePrefix {
+		// SHA1 hash of the pod name and namespace
+		h := sha1.New()
+		h.Write([]byte(fmt.Sprintf("%s.%s.%d", podName, podNamespace, interfaceIndex)))
+		vethName := fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:11])
+		// Check if the interface exists
+		_, err := getLinkByNameFunc(vethName)
+		if err == nil {
+			return vethName, nil
+		}
+	}
+	return "", fmt.Errorf("failed to find link for pod %s in namespace %s", podName, podNamespace)
+}
+
+func IsFileExistsError(err string) bool {
+	return strings.Contains(strings.ToLower(err), "file exists")
+}
+
+func IsInvalidFilterListError(err string) bool {
+	return strings.Contains(strings.ToLower(err), "failed to get filter list")
+}
+
+func IsMissingFilterError(err string) bool {
+	return strings.Contains(strings.ToLower(err), "no active filter to detach")
+}
+
+func Uint32ToIP(n uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, ipaddr)
+	binary.BigEndian.PutUint32(ip, n)
 	return ip
 }
 
-func ConvIPv4ToInt(ipaddr net.IP) uint32 {
-	return uint32(ipaddr[0])<<24 | uint32(ipaddr[1])<<16 | uint32(ipaddr[2])<<8 | uint32(ipaddr[3])
+// ByteToUInt32 converts a byte slice to a uint32
+// Note: This assumes LittleEndian architecture as per the existing code in ComputeTrieValue
+func ByteToUInt32(b []byte) uint32 {
+	return binary.LittleEndian.Uint32(b)
 }
 
-func ConvIntToIPv4NetworkOrder(ipaddr uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, ipaddr)
-	return ip
-}
-
-func ConvByteToIPv6(ipaddr [16]byte) net.IP {
-	ip := net.IP(ipaddr[:])
-	return ip
-}
-
-func ConvIPv6ToByte(ipaddr net.IP) []byte {
-	ipaddrBytes := ipaddr.To16()
-	return ipaddrBytes
-}
-
-type ConntrackKeyV6 struct {
-	Source_ip   [16]byte
-	Source_port uint16
-	_           uint16 //Padding
-	Dest_ip     [16]byte
-	Dest_port   uint16
-	Protocol    uint8
-	_           uint8    //Padding
-	Owner_ip    [16]byte //16
-}
-
-type ConntrackKey struct {
-	Source_ip   uint32
-	Source_port uint16
-	_           uint16 //Padding
-	Dest_ip     uint32
-	Dest_port   uint16
-	Protocol    uint8
-	_           uint8 //Padding
-	Owner_ip    uint32
-}
-
-type ConntrackVal struct {
-	Value uint8
-}
-
-func ConvConntrackV6ToByte(key ConntrackKeyV6) []byte {
-	ipSize := unsafe.Sizeof(key)
-	byteArray := (*[unsafe.Sizeof(key)]byte)(unsafe.Pointer(&key))
-	byteSlice := byteArray[:ipSize]
-	return byteSlice
-}
-
-func ConvByteToConntrackV6(keyByte []byte) ConntrackKeyV6 {
-	var v6key ConntrackKeyV6
-	byteArray := (*[unsafe.Sizeof(v6key)]byte)(unsafe.Pointer(&v6key))
-	copy(byteArray[:], keyByte)
-	return v6key
-}
-
-func CopyV6Bytes(dest *[16]byte, src [16]byte) {
-	for i := 0; i < len(src); i++ {
-		dest[i] = src[i]
-	}
-}
-
-type BPFTrieKey struct {
-	PrefixLen uint32
-	IP        uint32
-}
-
-type BPFTrieKeyV6 struct {
-	PrefixLen uint32
-	IP        [16]byte
-}
-
-type BPFTrieVal struct {
-	Protocol  uint32
-	StartPort uint32
-	EndPort   uint32
-}
-
-type BPFL4PriorityVal struct {
-	Protocol  uint32
-	Priority  uint32
-	StartPort uint32
-	EndPort   uint32
-}
-
-func ConvTrieV6ToByte(key BPFTrieKeyV6) []byte {
-	ipSize := unsafe.Sizeof(key)
-	byteArray := (*[20]byte)(unsafe.Pointer(&key))
-	byteSlice := byteArray[:ipSize]
-	return byteSlice
-}
-
-func ConvByteToTrieV6(keyByte []byte) BPFTrieKeyV6 {
-	var v6key BPFTrieKeyV6
-	byteArray := (*[unsafe.Sizeof(v6key)]byte)(unsafe.Pointer(&v6key))
-	copy(byteArray[:], keyByte)
-	return v6key
+// IsStrictMode returns true if the network policy mode is set to Strict Mode
+func IsStrictMode(networkPolicyMode string) bool {
+	return networkPolicyMode == "strict"
 }

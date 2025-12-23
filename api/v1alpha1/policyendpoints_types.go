@@ -96,6 +96,19 @@ type PodEndpoint struct {
 	Namespace string `json:"namespace"`
 }
 
+// SelectorMode defines the Pod matching mechanism used by the PolicyEndpoint
+// +kubebuilder:validation:Enum=PodName;Label;Hybrid
+type SelectorMode string
+
+const (
+	// SelectorModePodName uses only PodSelectorEndpoints for Pod matching (current behavior)
+	SelectorModePodName SelectorMode = "PodName"
+	// SelectorModeLabel uses only PodSelector label matching
+	SelectorModeLabel SelectorMode = "Label"
+	// SelectorModeHybrid uses both PodSelectorEndpoints and PodSelector for Pod matching
+	SelectorModeHybrid SelectorMode = "Hybrid"
+)
+
 // PolicyEndpointSpec defines the desired state of PolicyEndpoint
 type PolicyEndpointSpec struct {
 	// PodSelector is the podSelector from the policy resource
@@ -113,6 +126,15 @@ type PolicyEndpointSpec struct {
 	// PodSelectorEndpoints contains information about the pods
 	// matching the podSelector
 	PodSelectorEndpoints []PodEndpoint `json:"podSelectorEndpoints,omitempty"`
+
+	// SelectorMode determines which Pod matching mechanism to use.
+	// PodName: use only PodSelectorEndpoints (default, backward compatible)
+	// Label: use only PodSelector for label-based matching
+	// Hybrid: use both PodSelectorEndpoints and PodSelector
+	// +kubebuilder:validation:Enum=PodName;Label;Hybrid
+	// +kubebuilder:default=PodName
+	// +optional
+	SelectorMode SelectorMode `json:"selectorMode,omitempty"`
 
 	// Ingress is the list of ingress rules containing resolved network addresses
 	Ingress []EndpointInfo `json:"ingress,omitempty"`

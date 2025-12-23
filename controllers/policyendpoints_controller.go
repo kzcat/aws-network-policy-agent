@@ -24,18 +24,28 @@ import (
 	"time"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
+	"github.com/aws/aws-network-policy-agent/pkg/cache"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
+	npametrics "github.com/aws/aws-network-policy-agent/pkg/metrics"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	networking "k8s.io/api/networking/v1"
 )
@@ -82,11 +92,16 @@ func prometheusRegister() {
 
 // NewPolicyEndpointsReconciler constructs new PolicyEndpointReconciler
 func NewPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, enableIPv6 bool) *PolicyEndpointsReconciler {
+	metricsCollector := npametrics.NewMetricsCollector()
+	metricsCollector.Register()
+
 	r := &PolicyEndpointsReconciler{
-		k8sClient:  k8sClient,
-		nodeIP:     nodeIP,
-		ebpfClient: ebpfClient,
-		enableIPv6: enableIPv6,
+		k8sClient:        k8sClient,
+		nodeIP:           nodeIP,
+		ebpfClient:       ebpfClient,
+		enableIPv6:       enableIPv6,
+		selectorCache:    cache.NewSelectorCache(100, 5*time.Minute),
+		metricsCollector: metricsCollector,
 	}
 
 	prometheusRegister()
@@ -110,6 +125,10 @@ type PolicyEndpointsReconciler struct {
 	//BPF Client instance
 	ebpfClient ebpf.BpfClient
 	enableIPv6 bool
+	// Cache for label selector results
+	selectorCache *cache.SelectorCache
+	// Metrics collector for label selector feature
+	metricsCollector *npametrics.MetricsCollector
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints,verbs=get;list;watch
@@ -547,19 +566,228 @@ func (r *PolicyEndpointsReconciler) deriveTargetPods(ctx context.Context,
 	var targetPods []npatypes.Pod
 	podIdentifiers := make(map[string]bool)
 
+	// Determine the selector mode, defaulting to PodName for backward compatibility
+	selectorMode := policyEndpoint.Spec.SelectorMode
+	if selectorMode == "" {
+		selectorMode = policyk8sawsv1.SelectorModePodName
+	}
+
+	// Record reconciliation metric
+	if r.metricsCollector != nil {
+		r.metricsCollector.RecordReconciliation(string(selectorMode))
+	}
+
+	// Start timing for Pod lookup latency
+	start := time.Now()
+
+	nodeIP := net.ParseIP(r.nodeIP)
+
+	switch selectorMode {
+	case policyk8sawsv1.SelectorModePodName:
+		// Use existing PodSelectorEndpoints logic (current behavior)
+		targetPods, podIdentifiers = r.deriveTargetPodsFromPodSelectorEndpoints(ctx, policyEndpoint, parentPEList, nodeIP)
+
+	case policyk8sawsv1.SelectorModeLabel:
+		// Use only PodSelector label matching
+		targetPods, podIdentifiers = r.deriveTargetPodsFromLabelSelector(ctx, policyEndpoint, parentPEList, nodeIP)
+
+	default:
+		// Default to PodName mode for backward compatibility
+		targetPods, podIdentifiers = r.deriveTargetPodsFromPodSelectorEndpoints(ctx, policyEndpoint, parentPEList, nodeIP)
+	}
+
+	// Record Pod lookup latency
+	if r.metricsCollector != nil {
+		r.metricsCollector.RecordPodLookupLatency(string(selectorMode), policyEndpoint.Namespace, time.Since(start))
+	}
+
+	return targetPods, podIdentifiers
+}
+
+// deriveTargetPodsFromPodSelectorEndpoints derives target pods using PodSelectorEndpoints (existing behavior).
+// This is the original implementation that matches pods by name prefix.
+func (r *PolicyEndpointsReconciler) deriveTargetPodsFromPodSelectorEndpoints(ctx context.Context,
+	policyEndpoint *policyk8sawsv1.PolicyEndpoint, parentPEList []string, nodeIP net.IP) ([]npatypes.Pod, map[string]bool) {
+	var targetPods []npatypes.Pod
+	podIdentifiers := make(map[string]bool)
+
 	// Pods are grouped by Host IP. Individual node agents will filter (local) pods
 	// by the Host IP value.
-	nodeIP := net.ParseIP(r.nodeIP)
 	for _, pod := range policyEndpoint.Spec.PodSelectorEndpoints {
 		podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
 		if nodeIP.Equal(net.ParseIP(string(pod.HostIP))) {
 			targetPods = append(targetPods, npatypes.Pod{NamespacedName: types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, PodIP: pod.PodIP})
 			podIdentifiers[podIdentifier] = true
-			log().Infof("Found a matching Pod: name: %s namespace: %s podIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
+			log().Infof("Found a matching Pod (PodName mode): name: %s namespace: %s podIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
 		}
 		r.updatePodIdentifierToPEMap(ctx, podIdentifier, parentPEList)
 	}
 	return targetPods, podIdentifiers
+}
+
+// deriveTargetPodsFromLabelSelector derives target pods using PodSelector label matching.
+// It queries the Kubernetes API with the LabelSelector and filters results by local node HostIP.
+func (r *PolicyEndpointsReconciler) deriveTargetPodsFromLabelSelector(ctx context.Context,
+	policyEndpoint *policyk8sawsv1.PolicyEndpoint, parentPEList []string, nodeIP net.IP) ([]npatypes.Pod, map[string]bool) {
+	var targetPods []npatypes.Pod
+	podIdentifiers := make(map[string]bool)
+
+	if policyEndpoint.Spec.PodSelector == nil {
+		log().Infof("No PodSelector defined for PolicyEndpoint %s, returning empty target pods", policyEndpoint.Name)
+		return targetPods, podIdentifiers
+	}
+
+	// Generate selector hash for caching and PodIdentifier generation
+	selectorHash := utils.GenerateLabelSelectorHash(policyEndpoint.Spec.PodSelector)
+	if selectorHash == "" {
+		log().Errorf("Failed to generate selector hash for PolicyEndpoint %s", policyEndpoint.Name)
+		return targetPods, podIdentifiers
+	}
+
+	// Try to get from cache first
+	if cachedPods, found := r.selectorCache.Get(selectorHash); found {
+		log().Debugf("Cache hit for selector hash %s", selectorHash)
+		// Record cache hit metric
+		if r.metricsCollector != nil {
+			r.metricsCollector.RecordCacheHit()
+		}
+		// Generate PodIdentifier for label selector mode
+		podIdentifier := utils.GetLabelSelectorPodIdentifier(policyEndpoint.Spec.PodSelector, policyEndpoint.Namespace)
+		if podIdentifier != "" {
+			podIdentifiers[podIdentifier] = true
+			r.updatePodIdentifierToPEMap(ctx, podIdentifier, parentPEList)
+		}
+		return cachedPods, podIdentifiers
+	}
+
+	// Record cache miss metric
+	if r.metricsCollector != nil {
+		r.metricsCollector.RecordCacheMiss()
+	}
+
+	// Use shared helper to get local pods matching selector
+	localPods, err := r.getLocalPodsBySelector(ctx, policyEndpoint.Spec.PodSelector, policyEndpoint.Namespace, nodeIP)
+	if err != nil {
+		log().Errorf("Failed to list local pods by label selector for PolicyEndpoint %s: %v", policyEndpoint.Name, err)
+		return targetPods, podIdentifiers
+	}
+
+	for _, pod := range localPods {
+		targetPods = append(targetPods, pod)
+		log().Infof("Found a matching Pod (Label mode): name: %s namespace: %s", pod.Name, pod.Namespace)
+	}
+
+	// Generate PodIdentifier for label selector mode
+	podIdentifier := utils.GetLabelSelectorPodIdentifier(policyEndpoint.Spec.PodSelector, policyEndpoint.Namespace)
+	if podIdentifier != "" && len(targetPods) > 0 {
+		podIdentifiers[podIdentifier] = true
+		r.updatePodIdentifierToPEMap(ctx, podIdentifier, parentPEList)
+	}
+
+	// Cache the results
+	if len(targetPods) > 0 {
+		r.selectorCache.Set(selectorHash, targetPods)
+		// Update cache size metric
+		if r.metricsCollector != nil {
+			r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
+		}
+	}
+
+	return targetPods, podIdentifiers
+}
+
+// getLocalPodsBySelector retrieves pods matching the selector and filters by local node IP.
+// This is a shared helper method used by both Label and Hybrid selector modes.
+func (r *PolicyEndpointsReconciler) getLocalPodsBySelector(ctx context.Context,
+	selector *metav1.LabelSelector, namespace string, nodeIP net.IP) ([]npatypes.Pod, error) {
+	var localPods []npatypes.Pod
+
+	// Query Kubernetes API with LabelSelector
+	matchingPods, err := r.listPodsByLabelSelector(ctx, selector, namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter results by local node HostIP
+	for _, pod := range matchingPods {
+		if pod.Status.HostIP == "" {
+			continue
+		}
+		if nodeIP.Equal(net.ParseIP(pod.Status.HostIP)) {
+			podIP := ""
+			if len(pod.Status.PodIPs) > 0 {
+				podIP = pod.Status.PodIPs[0].IP
+			} else if pod.Status.PodIP != "" {
+				podIP = pod.Status.PodIP
+			}
+
+			localPods = append(localPods, npatypes.Pod{
+				NamespacedName: types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace},
+				PodIP:          policyk8sawsv1.NetworkAddress(podIP),
+			})
+		}
+	}
+
+	return localPods, nil
+}
+
+// listPodsByLabelSelector queries the Kubernetes API to list pods matching the given LabelSelector.
+func (r *PolicyEndpointsReconciler) listPodsByLabelSelector(ctx context.Context,
+	selector *metav1.LabelSelector, namespace string) ([]corev1.Pod, error) {
+	if selector == nil {
+		return nil, nil
+	}
+
+	// Convert LabelSelector to labels.Selector
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	// List pods matching the selector
+	podList := &corev1.PodList{}
+	listOpts := &client.ListOptions{
+		Namespace:     namespace,
+		LabelSelector: labelSelector,
+	}
+
+	if err := r.k8sClient.List(ctx, podList, listOpts); err != nil {
+		return nil, err
+	}
+
+	// Filter out pods that are not running or are being deleted
+	var runningPods []corev1.Pod
+	for _, pod := range podList.Items {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		runningPods = append(runningPods, pod)
+	}
+
+	return runningPods, nil
+}
+
+// GetSelectorCache returns the selector cache for testing purposes.
+func (r *PolicyEndpointsReconciler) GetSelectorCache() *cache.SelectorCache {
+	return r.selectorCache
+}
+
+// MatchesLabelSelector checks if a pod's labels match the given LabelSelector.
+// This is a utility function for testing and validation.
+func MatchesLabelSelector(podLabels map[string]string, selector *metav1.LabelSelector) bool {
+	if selector == nil {
+		return true // nil selector matches all pods
+	}
+
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return false
+	}
+
+	return labelSelector.Matches(labels.Set(podLabels))
 }
 
 func (r *PolicyEndpointsReconciler) getPodListToBeCleanedUp(oldPodSet []npatypes.Pod,
@@ -675,7 +903,30 @@ func (r *PolicyEndpointsReconciler) addCatchAllEntry(firewallRules *[]fwrp.EbpfF
 func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&policyk8sawsv1.PolicyEndpoint{}).
+		WatchesRawSource(
+			source.Kind(
+				mgr.GetCache(),
+				&corev1.Pod{},
+				handler.TypedEnqueueRequestsFromMapFunc(r.mapPodToReconcileRequests),
+				PodLabelChangePredicate{},
+			),
+		).
 		Complete(r)
+}
+
+// mapPodToReconcileRequests maps Pod events to reconcile requests for affected PolicyEndpoints.
+// This is called by the controller-runtime when a Pod event passes the PodLabelChangePredicate filter.
+func (r *PolicyEndpointsReconciler) mapPodToReconcileRequests(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
+	// Only process pods on the local node
+	if pod.Status.HostIP != r.nodeIP {
+		return nil
+	}
+
+	// Invalidate selector cache for any selectors that might be affected
+	r.invalidateCacheForPod(pod)
+
+	// Find PolicyEndpoints whose selectors match this pod
+	return r.findAffectedPolicyEndpoints(ctx, pod)
 }
 
 func (r *PolicyEndpointsReconciler) derivePolicyEndpointsOfParentNP(ctx context.Context, parentNP, resourceNamespace string) []string {
@@ -736,5 +987,224 @@ func (r *PolicyEndpointsReconciler) ArePoliciesAvailableInLocalCache(podIdentifi
 			return true
 		}
 	}
+	return false
+}
+
+// PodEventHandler handles Pod lifecycle events for label selector mode.
+// It detects label changes and triggers reconciliation for affected PolicyEndpoints.
+
+// OnPodCreate handles new Pod creation events.
+// When a new Pod is created with labels matching an existing PolicyEndpoint's selector,
+// this triggers reconciliation for affected PolicyEndpoints.
+func (r *PolicyEndpointsReconciler) OnPodCreate(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
+	log().Infof("Pod created: %s/%s", pod.Namespace, pod.Name)
+
+	// Only process pods on the local node
+	if pod.Status.HostIP != r.nodeIP {
+		return nil
+	}
+
+	// Invalidate selector cache for any selectors that might match this pod
+	r.invalidateCacheForPod(pod)
+
+	// Find PolicyEndpoints whose selectors match this pod
+	return r.findAffectedPolicyEndpoints(ctx, pod)
+}
+
+// OnPodUpdate handles Pod update events including label changes.
+// When a Pod's labels change, this detects the change and triggers reconciliation
+// for PolicyEndpoints that were affected by the old labels or are affected by the new labels.
+func (r *PolicyEndpointsReconciler) OnPodUpdate(ctx context.Context, oldPod, newPod *corev1.Pod) []reconcile.Request {
+	// Only process pods on the local node
+	if newPod.Status.HostIP != r.nodeIP && oldPod.Status.HostIP != r.nodeIP {
+		return nil
+	}
+
+	// Check if labels have changed
+	if !labelsChanged(oldPod.Labels, newPod.Labels) {
+		return nil
+	}
+
+	log().Infof("Pod labels changed: %s/%s", newPod.Namespace, newPod.Name)
+
+	// Invalidate selector cache for any selectors that might be affected
+	r.invalidateCacheForPod(oldPod)
+	r.invalidateCacheForPod(newPod)
+
+	// Find PolicyEndpoints affected by both old and new labels
+	var requests []reconcile.Request
+	seenPEs := make(map[types.NamespacedName]bool)
+
+	// Find PolicyEndpoints that matched the old labels
+	oldRequests := r.findAffectedPolicyEndpoints(ctx, oldPod)
+	for _, req := range oldRequests {
+		if !seenPEs[req.NamespacedName] {
+			requests = append(requests, req)
+			seenPEs[req.NamespacedName] = true
+		}
+	}
+
+	// Find PolicyEndpoints that match the new labels
+	newRequests := r.findAffectedPolicyEndpoints(ctx, newPod)
+	for _, req := range newRequests {
+		if !seenPEs[req.NamespacedName] {
+			requests = append(requests, req)
+			seenPEs[req.NamespacedName] = true
+		}
+	}
+
+	return requests
+}
+
+// OnPodDelete handles Pod deletion events.
+// When a Pod is deleted, this triggers reconciliation for PolicyEndpoints
+// whose selectors matched the deleted Pod.
+func (r *PolicyEndpointsReconciler) OnPodDelete(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
+	log().Infof("Pod deleted: %s/%s", pod.Namespace, pod.Name)
+
+	// Only process pods on the local node
+	if pod.Status.HostIP != r.nodeIP {
+		return nil
+	}
+
+	// Invalidate selector cache specific to this pod
+	if r.selectorCache != nil {
+		r.selectorCache.InvalidateForPodDelete(types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace})
+		// Update cache size metric after invalidation
+		if r.metricsCollector != nil {
+			r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
+		}
+	}
+
+	// Find PolicyEndpoints whose selectors matched this pod
+	return r.findAffectedPolicyEndpoints(ctx, pod)
+}
+
+// labelsChanged checks if the labels have changed between old and new pod.
+// It treats nil and empty map as equivalent (both represent "no labels").
+func labelsChanged(oldLabels, newLabels map[string]string) bool {
+	// Treat nil and empty map as equivalent
+	oldLen := len(oldLabels)
+	newLen := len(newLabels)
+
+	// If both are empty (nil or empty map), no change
+	if oldLen == 0 && newLen == 0 {
+		return false
+	}
+
+	// If lengths differ, labels changed
+	if oldLen != newLen {
+		return true
+	}
+
+	// Compare key-value pairs
+	for k, v := range oldLabels {
+		if newV, ok := newLabels[k]; !ok || newV != v {
+			return true
+		}
+	}
+
+	return false
+}
+
+// invalidateCacheForPod invalidates selector cache entries that might be affected by a pod change.
+func (r *PolicyEndpointsReconciler) invalidateCacheForPod(pod *corev1.Pod) {
+	if r.selectorCache == nil {
+		return
+	}
+
+	// Invalidate all cache entries for the pod's namespace
+	// This is a conservative approach - we could be more precise by checking
+	// which selectors actually match the pod's labels
+	r.selectorCache.InvalidateByNamespace(pod.Namespace)
+
+	// Update cache size metric after invalidation
+	if r.metricsCollector != nil {
+		r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
+	}
+}
+
+// findAffectedPolicyEndpoints finds all PolicyEndpoints whose selectors match the given pod.
+// It returns reconcile requests for each affected PolicyEndpoint.
+func (r *PolicyEndpointsReconciler) findAffectedPolicyEndpoints(ctx context.Context, pod *corev1.Pod) []reconcile.Request {
+	var requests []reconcile.Request
+
+	// List all PolicyEndpoints in the pod's namespace
+	policyEndpointList := &policyk8sawsv1.PolicyEndpointList{}
+	if err := r.k8sClient.List(ctx, policyEndpointList, &client.ListOptions{
+		Namespace: pod.Namespace,
+	}); err != nil {
+		log().Errorf("Failed to list PolicyEndpoints for namespace %s: %v", pod.Namespace, err)
+		return requests
+	}
+
+	// Check each PolicyEndpoint to see if its selector matches the pod
+	for _, pe := range policyEndpointList.Items {
+		// Skip PolicyEndpoints that only use PodName mode (they don't use label selectors)
+		if pe.Spec.SelectorMode == policyk8sawsv1.SelectorModePodName || pe.Spec.SelectorMode == "" {
+			// For PodName mode, check if the pod is in PodSelectorEndpoints
+			if r.podInPodSelectorEndpoints(pod, pe.Spec.PodSelectorEndpoints) {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      pe.Name,
+						Namespace: pe.Namespace,
+					},
+				})
+			}
+			continue
+		}
+
+		// For Label or Hybrid mode, check if the pod matches the PodSelector
+		if pe.Spec.PodSelector != nil {
+			if MatchesLabelSelector(pod.Labels, pe.Spec.PodSelector) {
+				log().Infof("Pod %s/%s matches PolicyEndpoint %s selector", pod.Namespace, pod.Name, pe.Name)
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      pe.Name,
+						Namespace: pe.Namespace,
+					},
+				})
+				continue
+			}
+		}
+	}
+
+	return requests
+}
+
+// podInPodSelectorEndpoints checks if a pod is listed in the PodSelectorEndpoints.
+func (r *PolicyEndpointsReconciler) podInPodSelectorEndpoints(pod *corev1.Pod, endpoints []policyk8sawsv1.PodEndpoint) bool {
+	for _, endpoint := range endpoints {
+		if endpoint.Name == pod.Name && endpoint.Namespace == pod.Namespace {
+			return true
+		}
+	}
+	return false
+}
+
+// PodLabelChangePredicate filters Pod events to only process relevant changes.
+// It passes through create and delete events, and for update events,
+// it only passes through if labels have changed.
+type PodLabelChangePredicate struct {
+	predicate.TypedFuncs[*corev1.Pod]
+}
+
+// Create returns true for Pod create events.
+func (p PodLabelChangePredicate) Create(e event.TypedCreateEvent[*corev1.Pod]) bool {
+	return true
+}
+
+// Delete returns true for Pod delete events.
+func (p PodLabelChangePredicate) Delete(e event.TypedDeleteEvent[*corev1.Pod]) bool {
+	return true
+}
+
+// Update returns true only if Pod labels have changed.
+func (p PodLabelChangePredicate) Update(e event.TypedUpdateEvent[*corev1.Pod]) bool {
+	return labelsChanged(e.ObjectOld.Labels, e.ObjectNew.Labels)
+}
+
+// Generic returns false for generic events.
+func (p PodLabelChangePredicate) Generic(e event.TypedGenericEvent[*corev1.Pod]) bool {
 	return false
 }
