@@ -97,7 +97,7 @@ type PodEndpoint struct {
 }
 
 // SelectorMode defines the Pod matching mechanism used by the PolicyEndpoint
-// +kubebuilder:validation:Enum=PodName;Label;Hybrid
+// +kubebuilder:validation:Enum=PodName;Label
 type SelectorMode string
 
 const (
@@ -105,8 +105,6 @@ const (
 	SelectorModePodName SelectorMode = "PodName"
 	// SelectorModeLabel uses only PodSelector label matching
 	SelectorModeLabel SelectorMode = "Label"
-	// SelectorModeHybrid uses both PodSelectorEndpoints and PodSelector for Pod matching
-	SelectorModeHybrid SelectorMode = "Hybrid"
 )
 
 // PolicyEndpointSpec defines the desired state of PolicyEndpoint
@@ -130,8 +128,7 @@ type PolicyEndpointSpec struct {
 	// SelectorMode determines which Pod matching mechanism to use.
 	// PodName: use only PodSelectorEndpoints (default, backward compatible)
 	// Label: use only PodSelector for label-based matching
-	// Hybrid: use both PodSelectorEndpoints and PodSelector
-	// +kubebuilder:validation:Enum=PodName;Label;Hybrid
+	// +kubebuilder:validation:Enum=PodName;Label
 	// +kubebuilder:default=PodName
 	// +optional
 	SelectorMode SelectorMode `json:"selectorMode,omitempty"`
