@@ -45,9 +45,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-		"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	
-		networking "k8s.io/api/networking/v1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	networking "k8s.io/api/networking/v1"
 )
 
 func log() logger.Logger {
@@ -326,7 +327,7 @@ func (r *PolicyEndpointsReconciler) cleanupPod(ctx context.Context, targetPod np
 	// is the only PolicyEndpoint resource that applies to this pod. If not, just update the Ingress/Egress Map contents
 	if _, ok := r.podIdentifierToPolicyEndpointMap.Load(podIdentifier); ok {
 		ingressRules, egressRules, isIngressIsolated, isEgressIsolated, err = r.deriveIngressAndEgressFirewallRules(ctx, podIdentifier, targetPod.Namespace,
-			policyEndpoint, isDeleteFlow)
+			policyEndpoint, iDeleteFlow)
 		if err != nil {
 			log().Errorf("Error Parsing policy Endpoint resource %s: %v", policyEndpoint, err)
 			return err
@@ -914,7 +915,7 @@ var podLabelChangePredicate = predicate.Funcs{
 
 // mapPodToPolicyEndpoints converts a Pod object to a list of reconcile.Request
 // for PolicyEndpoints that may be affected by that Pod.
-func (r *PolicyEndpointsReconciler) mapPodToPolicyEndpoints(ctx context.Context, obj client.Object) []reconcile.Request {
+func (r *PolicyEndpointsReconciler) mapPodToPolicyEndpoints(obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok || pod == nil {
 		return nil
@@ -927,19 +928,22 @@ func (r *PolicyEndpointsReconciler) mapPodToPolicyEndpoints(ctx context.Context,
 	// Invalidate cache for the affected pod
 	r.invalidateCacheForPod(pod)
 
-	// Reuse existing findAffectedPolicyEndpoints helper
-	return r.findAffectedPolicyEndpoints(ctx, pod)
+	// Use background context for the listing helper
+	return r.findAffectedPolicyEndpoints(context.Background(), pod)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PolicyEndpointsReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	// Wrap map function for the handler
+	toRequests := handler.ToRequestsFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		return r.mapPodToPolicyEndpoints(obj)
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&policyk8sawsv1.PolicyEndpoint{}).
 		Watches(
-			&corev1.Pod{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				return r.mapPodToPolicyEndpoints(ctx, obj)
-			}),
+			&source.Kind{Type: &corev1.Pod{}},
+			&handler.EnqueueRequestsFromMapFunc{ToRequests: toRequests},
 			builder.WithPredicates(podLabelChangePredicate),
 		).
 		Complete(r)
