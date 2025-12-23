@@ -583,6 +583,10 @@ func (r *PolicyEndpointsReconciler) deriveTargetPods(ctx context.Context,
 	start := time.Now()
 
 	nodeIP := net.ParseIP(r.nodeIP)
+	if nodeIP == nil {
+		log().Errorf("Invalid or missing node IP: %s", r.nodeIP)
+		return targetPods, podIdentifiers
+	}
 
 	switch selectorMode {
 	case policyk8sawsv1.SelectorModePodName:

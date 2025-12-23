@@ -205,7 +205,8 @@ func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
 	}
 
 	hash := sha256.Sum256([]byte(selectorString))
-	return hex.EncodeToString(hash[:])[:12]
+	// Return first 16 characters of hex-encoded hash
+	return hex.EncodeToString(hash[:])[:16]
 }
 
 // GetLabelSelectorPodIdentifier generates a PodIdentifier for label selector mode.

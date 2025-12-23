@@ -799,7 +799,7 @@ func TestGenerateLabelSelectorHash(t *testing.T) {
 			args: args{
 				selector: &metav1.LabelSelector{},
 			},
-			want: "44136fa355b3", // SHA-256 of "{}"
+			want: "44136fa355b3678a", // SHA-256 of "{}"
 		},
 		{
 			name: "Simple matchLabels selector",
@@ -810,7 +810,7 @@ func TestGenerateLabelSelectorHash(t *testing.T) {
 					},
 				},
 			},
-			want: "cc2466ecfde1",
+			want: "cc2466ecfde13fdc",
 		},
 	}
 
@@ -844,7 +844,7 @@ func TestGenerateLabelSelectorHash_Determinism(t *testing.T) {
 
 	assert.Equal(t, hash1, hash2, "Hash should be deterministic")
 	assert.Equal(t, hash2, hash3, "Hash should be deterministic")
-	assert.Len(t, hash1, 12, "Hash should be 12 characters")
+	assert.Len(t, hash1, 16, "Hash should be 16 characters")
 }
 
 func TestGenerateLabelSelectorHash_OrderIndependence(t *testing.T) {
@@ -948,82 +948,81 @@ func TestGetLabelSelectorPodIdentifier(t *testing.T) {
 			},
 			want: "",
 		},
-		{
-			name: "Simple matchLabels selector in default namespace",
-			args: args{
-				selector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						"app": "nginx",
-					},
-				},
-				namespace: "default",
-			},
-			want: "label-cc2466ecfde1-default",
-		},
-		{
-			name: "Simple matchLabels selector in custom namespace",
-			args: args{
-				selector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						"app": "nginx",
-					},
-				},
-				namespace: "production",
-			},
-			want: "label-cc2466ecfde1-production",
-		},
-		{
-			name: "Complex selector with matchExpressions",
-			args: args{
-				selector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						"app":  "nginx",
-						"tier": "frontend",
-					},
-					MatchExpressions: []metav1.LabelSelectorRequirement{
-						{
-							Key:      "environment",
-							Operator: metav1.LabelSelectorOpIn,
-							Values:   []string{"production", "staging"},
-						},
-					},
-				},
-				namespace: "web",
-			},
-			want: "label-9cce436cb160-web",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := GetLabelSelectorPodIdentifier(tt.args.selector, tt.args.namespace)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestGetLabelSelectorPodIdentifier_Format(t *testing.T) {
-	// Test that the identifier follows the expected format: "label-{hash}-{namespace}"
-	selector := &metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			"app": "test",
-		},
-	}
-
-	identifier := GetLabelSelectorPodIdentifier(selector, "myns")
-
-	// Verify format
-	assert.True(t, strings.HasPrefix(identifier, "label-"), "Identifier should start with 'label-'")
-	assert.True(t, strings.HasSuffix(identifier, "-myns"), "Identifier should end with '-{namespace}'")
-
-	// Verify structure: label-{12 char hash}-{namespace}
-	parts := strings.Split(identifier, "-")
-	assert.Equal(t, 3, len(parts), "Identifier should have 3 parts separated by '-'")
-	assert.Equal(t, "label", parts[0])
-	assert.Len(t, parts[1], 12, "Hash should be 12 characters")
-	assert.Equal(t, "myns", parts[2])
-}
-
+		        {
+		            name: "Simple matchLabels selector in default namespace",
+		            args: args{
+		                selector: &metav1.LabelSelector{
+		                    MatchLabels: map[string]string{
+		                        "app": "nginx",
+		                    },
+		                },
+		                namespace: "default",
+		            },
+		            want: "label-cc2466ecfde13fdc-default",
+		        },
+		        {
+		            name: "Simple matchLabels selector in custom namespace",
+		            args: args{
+		                selector: &metav1.LabelSelector{
+		                    MatchLabels: map[string]string{
+		                        "app": "nginx",
+		                    },
+		                },
+		                namespace: "production",
+		            },
+		            want: "label-cc2466ecfde13fdc-production",
+		        },
+		        {
+		            name: "Complex selector with matchExpressions",
+		            args: args{
+		                selector: &metav1.LabelSelector{
+		                    MatchLabels: map[string]string{
+		                        "app":  "nginx",
+		                        "tier": "frontend",
+		                    },
+		                    MatchExpressions: []metav1.LabelSelectorRequirement{
+		                        {
+		                            Key:      "environment",
+		                            Operator: metav1.LabelSelectorOpIn,
+		                            Values:   []string{"production", "staging"},
+		                        },
+		                    },
+		                },
+		                namespace: "web",
+		            },
+		            want: "label-9cce436cb1600869-web",
+		        },
+		    }
+		
+		    for _, tt := range tests {
+		        t.Run(tt.name, func(t *testing.T) {
+		            got := GetLabelSelectorPodIdentifier(tt.args.selector, tt.args.namespace)
+		            assert.Equal(t, tt.want, got)
+		        })
+		    }
+		}
+		
+		func TestGetLabelSelectorPodIdentifier_Format(t *testing.T) {
+		    // Test that the identifier follows the expected format: "label-{hash}-{namespace}"
+		    selector := &metav1.LabelSelector{
+		        MatchLabels: map[string]string{
+		            "app": "test",
+		        },
+		    }
+		
+		    identifier := GetLabelSelectorPodIdentifier(selector, "myns")
+		
+		    // Verify format
+		    assert.True(t, strings.HasPrefix(identifier, "label-"), "Identifier should start with 'label-'")
+		    assert.True(t, strings.HasSuffix(identifier, "-myns"), "Identifier should end with '-{namespace}'")
+		
+		    // Verify structure: label-{16 char hash}-{namespace}
+		    parts := strings.Split(identifier, "-")
+		    assert.Equal(t, 3, len(parts), "Identifier should have 3 parts separated by '-'")
+		    assert.Equal(t, "label", parts[0])
+		    assert.Len(t, parts[1], 16, "Hash should be 16 characters")
+		    assert.Equal(t, "myns", parts[2])
+		}
 func TestGetLabelSelectorPodIdentifier_Determinism(t *testing.T) {
 	// Test that the same selector and namespace always produce the same identifier
 	selector := &metav1.LabelSelector{
