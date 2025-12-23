@@ -135,6 +135,7 @@ type PolicyEndpointsReconciler struct {
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints,verbs=get;list;watch
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints/status,verbs=get
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 func (r *PolicyEndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log().Infof("Received a new reconcile request %v", req)

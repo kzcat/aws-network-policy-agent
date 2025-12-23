@@ -40,6 +40,9 @@ const (
 	TC_INGRESS_POD_STATE_MAP        = "ingress_pod_state_map"
 	TC_EGRESS_POD_STATE_MAP         = "egress_pod_state_map"
 	DEFAULT_CLUSTER_NAME            = "default"
+	// LABEL_SELECTOR_HASH_LEN is the length of the hex-encoded hash used for selector identifiers.
+	// 16 characters provide a good balance between collision resistance and identifier length.
+	LABEL_SELECTOR_HASH_LEN = 16
 )
 
 var (
@@ -115,10 +118,8 @@ func ComputeTrieValue(Ports []v1alpha1.Port, allowAll bool, denyAll bool) []byte
 		value = append(value, bs...)
 		binary.LittleEndian.PutUint32(bs, endPort)
 		value = append(value, bs...)
-		// Total 12 bytes per port
 	}
 	
-	// Fill the remaining bytes with 0s up to TRIE_VALUE_LENGTH (288)
 	padding := 288 - len(value)
 	if padding > 0 {
 		for i := 0; i < padding; i++ {
@@ -140,13 +141,9 @@ func GetPodIdentifier(podName, podNamespace string) string {
 		tmpName := strings.Split(podName, "-")
 		podName = strings.Join(tmpName[:len(tmpName)-1], "-")
 	}
-	// Note: Test expectations don't include "pod-" prefix.
 	return podName + "-" + podNamespace
 }
 
-// GenerateLabelSelectorHash generates a deterministic hash from a LabelSelector.
-// It uses an explicit normalization logic (sorting keys and expressions) to ensure
-// the hash remains stable regardless of input order or library implementation changes.
 func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
 	if selector == nil {
 		return ""
@@ -154,7 +151,6 @@ func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
 
 	var sb strings.Builder
 
-	// 1. matchLabels: sort keys alphabetically for determinism
 	if len(selector.MatchLabels) > 0 {
 		keys := make([]string, 0, len(selector.MatchLabels))
 		for k := range selector.MatchLabels {
@@ -170,7 +166,6 @@ func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
 		}
 	}
 
-	// 2. matchExpressions: sort by key, then operator, then sorted values
 	if len(selector.MatchExpressions) > 0 {
 		exprs := make([]metav1.LabelSelectorRequirement, len(selector.MatchExpressions))
 		copy(exprs, selector.MatchExpressions)
@@ -205,11 +200,9 @@ func GenerateLabelSelectorHash(selector *metav1.LabelSelector) string {
 	}
 
 	hash := sha256.Sum256([]byte(selectorString))
-	// Return first 16 characters of hex-encoded hash
-	return hex.EncodeToString(hash[:])[:16]
+	return hex.EncodeToString(hash[:])[:LABEL_SELECTOR_HASH_LEN]
 }
 
-// GetLabelSelectorPodIdentifier generates a PodIdentifier for label selector mode.
 func GetLabelSelectorPodIdentifier(selector *metav1.LabelSelector, namespace string) string {
 	if selector == nil {
 		return ""
@@ -296,6 +289,10 @@ func ByteToUInt32(b []byte) uint32 {
 
 func IsStrictMode(networkPolicyMode string) bool {
 	return networkPolicyMode == "strict"
+}
+
+func IsValidNetworkPolicyEnforcingMode(mode string) bool {
+	return mode == "standard" || mode == "strict"
 }
 
 type L4Rule struct {
@@ -400,7 +397,7 @@ type ConntrackKeyV6 struct {
 }
 
 type ConntrackVal struct {
-	Val uint8
+	Value uint8
 }
 
 func ConvIPv4ToInt(ip net.IP) uint32 {
@@ -500,4 +497,46 @@ func ConvByteArrayToIP(val uint32) string {
 
 func GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, direction string) string {
 	return "/sys/fs/bpf/globals/aws/maps/" + podIdentifier + "_" + direction + "_pod_state_map"
+}
+
+type BPFTrieKey struct {
+	PrefixLen uint32
+	IP        uint32
+}
+
+type BPFTrieKeyV6 struct {
+	PrefixLen uint32
+	IP        [16]byte
+}
+
+type BPFTrieVal struct {
+	Protocol  uint32
+	StartPort uint32
+	EndPort   uint32
+}
+
+type BPFL4PriorityVal struct {
+	Protocol  uint32
+	Priority  uint32
+	StartPort uint32
+	EndPort   uint32
+}
+
+func ConvTrieV6ToByte(k BPFTrieKeyV6) []byte {
+    var b []byte
+    bs4 := make([]byte, 4)
+    binary.LittleEndian.PutUint32(bs4, k.PrefixLen)
+    b = append(b, bs4...)
+    b = append(b, k.IP[:]...)
+    return b
+}
+
+func ConvByteToTrieV6(b []byte) BPFTrieKeyV6 {
+    var k BPFTrieKeyV6
+    if len(b) < 20 {
+        return k
+    }
+    k.PrefixLen = binary.LittleEndian.Uint32(b[0:4])
+    copy(k.IP[:], b[4:20])
+    return k
 }
