@@ -7,16 +7,37 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
-	multierror "github.com/hashicorp/go-multierror"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	TCP_PROTOCOL_NUMBER             = 6
+	UDP_PROTOCOL_NUMBER             = 17
+	SCTP_PROTOCOL_NUMBER            = 132
+	ICMP_PROTOCOL_NUMBER            = 1
+	RESERVED_IP_PROTOCOL_NUMBER     = 255 // 255 is a reserved protocol value in the IP header
+	ANY_IP_PROTOCOL                 = 254
+	TRIE_KEY_LENGTH                 = 8
+	TRIE_V6_KEY_LENGTH              = 20
+	TRIE_VALUE_LENGTH               = 288
+	ADMIN_TRIE_VALUE_LENGTH         = 384
+	PE_PRIORITY                     = 1500
+	BPF_PROGRAMS_PIN_PATH_DIRECTORY = "/sys/fs/bpf/globals/aws/programs/"
+	BPF_MAPS_PIN_PATH_DIRECTORY     = "/sys/fs/bpf/globals/aws/maps/"
+	TC_INGRESS_PROG                 = "handle_ingress"
+	TC_EGRESS_PROG                  = "handle_egress"
+	TC_INGRESS_MAP                  = "ingress_map"
+	TC_EGRESS_MAP                   = "egress_map"
+	TC_CLUSTER_POLICY_INGRESS_MAP   = "cp_ingress_map"
+	TC_CLUSTER_POLICY_EGRESS_MAP    = "cp_egress_map"
+	TC_INGRESS_POD_STATE_MAP        = "ingress_pod_state_map"
+	TC_EGRESS_POD_STATE_MAP         = "egress_pod_state_map"
 )
 
 var (
@@ -69,11 +90,11 @@ func ComputeTrieValue(Ports []v1alpha1.Port, allowAll bool, denyAll bool) []byte
 
 	for _, port := range Ports {
 		if *port.Protocol == corev1.ProtocolTCP {
-			protocol = 0x6
+			protocol = TCP_PROTOCOL_NUMBER
 		} else if *port.Protocol == corev1.ProtocolUDP {
-			protocol = 0x11
+			protocol = UDP_PROTOCOL_NUMBER
 		} else if *port.Protocol == corev1.ProtocolSCTP {
-			protocol = 0x84
+			protocol = SCTP_PROTOCOL_NUMBER
 		}
 		// TODO Protocol ICMP/v6?
 
