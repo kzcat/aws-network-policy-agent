@@ -24,11 +24,9 @@ import (
 	"time"
 
 	policyk8sawsv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
-	"github.com/aws/aws-network-policy-agent/pkg/cache"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
-	npametrics "github.com/aws/aws-network-policy-agent/pkg/metrics"
 	npatypes "github.com/aws/aws-network-policy-agent/pkg/types"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
@@ -92,16 +90,11 @@ func prometheusRegister() {
 
 // NewPolicyEndpointsReconciler constructs new PolicyEndpointReconciler
 func NewPolicyEndpointsReconciler(k8sClient client.Client, nodeIP string, ebpfClient ebpf.BpfClient, enableIPv6 bool) *PolicyEndpointsReconciler {
-	metricsCollector := npametrics.NewMetricsCollector()
-	metricsCollector.Register()
-
 	r := &PolicyEndpointsReconciler{
-		k8sClient:        k8sClient,
-		nodeIP:           nodeIP,
-		ebpfClient:       ebpfClient,
-		enableIPv6:       enableIPv6,
-		selectorCache:    cache.NewSelectorCache(100, 5*time.Minute),
-		metricsCollector: metricsCollector,
+		k8sClient:  k8sClient,
+		nodeIP:     nodeIP,
+		ebpfClient: ebpfClient,
+		enableIPv6: enableIPv6,
 	}
 
 	prometheusRegister()
@@ -125,10 +118,6 @@ type PolicyEndpointsReconciler struct {
 	//BPF Client instance
 	ebpfClient ebpf.BpfClient
 	enableIPv6 bool
-	// Cache for label selector results
-	selectorCache *cache.SelectorCache
-	// Metrics collector for label selector feature
-	metricsCollector *npametrics.MetricsCollector
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints,verbs=get;list;watch
@@ -573,14 +562,6 @@ func (r *PolicyEndpointsReconciler) deriveTargetPods(ctx context.Context,
 		selectorMode = policyk8sawsv1.SelectorModePodName
 	}
 
-	// Record reconciliation metric
-	if r.metricsCollector != nil {
-		r.metricsCollector.RecordReconciliation(string(selectorMode))
-	}
-
-	// Start timing for Pod lookup latency
-	start := time.Now()
-
 	nodeIP := net.ParseIP(r.nodeIP)
 	if nodeIP == nil {
 		log().Errorf("Invalid or missing node IP: %s", r.nodeIP)
@@ -599,11 +580,6 @@ func (r *PolicyEndpointsReconciler) deriveTargetPods(ctx context.Context,
 	default:
 		// Default to PodName mode for backward compatibility
 		targetPods, podIdentifiers = r.deriveTargetPodsFromPodSelectorEndpoints(ctx, policyEndpoint, parentPEList, nodeIP)
-	}
-
-	// Record Pod lookup latency
-	if r.metricsCollector != nil {
-		r.metricsCollector.RecordPodLookupLatency(string(selectorMode), policyEndpoint.Namespace, time.Since(start))
 	}
 
 	return targetPods, podIdentifiers
@@ -642,34 +618,6 @@ func (r *PolicyEndpointsReconciler) deriveTargetPodsFromLabelSelector(ctx contex
 		return targetPods, podIdentifiers
 	}
 
-	// Generate selector hash for caching and PodIdentifier generation
-	selectorHash := utils.GenerateLabelSelectorHash(policyEndpoint.Spec.PodSelector)
-	if selectorHash == "" {
-		log().Errorf("Failed to generate selector hash for PolicyEndpoint %s", policyEndpoint.Name)
-		return targetPods, podIdentifiers
-	}
-
-	// Try to get from cache first
-	if cachedPods, found := r.selectorCache.Get(policyEndpoint.Namespace, selectorHash); found {
-		log().Debugf("Cache hit for selector hash %s", selectorHash)
-		// Record cache hit metric
-		if r.metricsCollector != nil {
-			r.metricsCollector.RecordCacheHit()
-		}
-		// Generate PodIdentifier for label selector mode
-		podIdentifier := utils.GetLabelSelectorPodIdentifier(policyEndpoint.Spec.PodSelector, policyEndpoint.Namespace)
-		if podIdentifier != "" {
-			podIdentifiers[podIdentifier] = true
-			r.updatePodIdentifierToPEMap(ctx, podIdentifier, parentPEList)
-		}
-		return cachedPods, podIdentifiers
-	}
-
-	// Record cache miss metric
-	if r.metricsCollector != nil {
-		r.metricsCollector.RecordCacheMiss()
-	}
-
 	// Use shared helper to get local pods matching selector
 	localPods, err := r.getLocalPodsBySelector(ctx, policyEndpoint.Spec.PodSelector, policyEndpoint.Namespace, nodeIP)
 	if err != nil {
@@ -687,15 +635,6 @@ func (r *PolicyEndpointsReconciler) deriveTargetPodsFromLabelSelector(ctx contex
 	if podIdentifier != "" && len(targetPods) > 0 {
 		podIdentifiers[podIdentifier] = true
 		r.updatePodIdentifierToPEMap(ctx, podIdentifier, parentPEList)
-	}
-
-	// Cache the results
-	if len(targetPods) > 0 {
-		r.selectorCache.Set(policyEndpoint.Namespace, selectorHash, policyEndpoint.Spec.PodSelector, targetPods)
-		// Update cache size metric
-		if r.metricsCollector != nil {
-			r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
-		}
 	}
 
 	return targetPods, podIdentifiers
@@ -768,11 +707,6 @@ func (r *PolicyEndpointsReconciler) listPodsByLabelSelector(ctx context.Context,
 	}
 
 	return runningPods, nil
-}
-
-// GetSelectorCache returns the selector cache for testing purposes.
-func (r *PolicyEndpointsReconciler) GetSelectorCache() *cache.SelectorCache {
-	return r.selectorCache
 }
 
 // MatchesLabelSelector checks if a pod's labels match the given LabelSelector.
@@ -924,9 +858,6 @@ func (r *PolicyEndpointsReconciler) mapPodToPolicyEndpoints(obj client.Object) [
 		return nil
 	}
 
-	// Invalidate cache for the affected pod
-	r.invalidateCacheForPod(pod)
-
 	// Use background context for the listing helper
 	return r.findAffectedPolicyEndpoints(context.Background(), pod)
 }
@@ -1029,21 +960,6 @@ func labelsChanged(oldLabels, newLabels map[string]string) bool {
 	}
 
 	return false
-}
-
-// invalidateCacheForPod invalidates selector cache entries that might be affected by a pod change.
-func (r *PolicyEndpointsReconciler) invalidateCacheForPod(pod *corev1.Pod) {
-	if r.selectorCache == nil {
-		return
-	}
-
-	// Invalidate cache entries affected by this pod's labels
-	r.selectorCache.InvalidateForPodUpdate(pod)
-
-	// Update cache size metric after invalidation
-	if r.metricsCollector != nil {
-		r.metricsCollector.UpdateSelectorCacheSize(r.selectorCache.Size())
-	}
 }
 
 // findAffectedPolicyEndpoints finds all PolicyEndpoints whose selectors match the given pod.
